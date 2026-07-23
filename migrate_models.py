@@ -17,6 +17,7 @@ from datetime import datetime
 
 import mlflow
 import mlflow.sklearn
+import mlflow.entities
 from mlflow.tracking import MlflowClient
 
 from config import (
@@ -480,15 +481,24 @@ class ModelMigrator:
                 print(f"  Deleted model: {name}")
             except:
                 pass
-        for exp in self.target_client.search_experiments():
+        # Clean ALL runs from migration experiments (including soft-deleted)
+        all_experiments = self.target_client.search_experiments(view_type=mlflow.entities.ViewType.ALL)
+        for exp in all_experiments:
             if 'dbx-migration' in exp.name:
                 try:
-                    # Delete all runs first
-                    runs = self.target_client.search_runs(experiment_ids=[exp.experiment_id])
+                    # Restore if deleted so we can access runs
+                    if exp.lifecycle_stage == 'deleted':
+                        self.target_client.restore_experiment(exp.experiment_id)
+                    # Delete all runs permanently
+                    runs = self.target_client.search_runs(
+                        experiment_ids=[exp.experiment_id],
+                        filter_string="",
+                        run_view_type=mlflow.entities.ViewType.ALL
+                    )
                     for run in runs:
                         self.target_client.delete_run(run.info.run_id)
                     self.target_client.delete_experiment(exp.experiment_id)
-                    print(f"  Deleted experiment: {exp.name}")
+                    print(f"  Cleaned: {exp.name} ({len(runs)} runs removed)")
                 except:
                     pass
 
