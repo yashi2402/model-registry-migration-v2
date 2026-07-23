@@ -68,39 +68,61 @@ class ModelMigrator:
         models = []
         full_prefix = f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}."
 
-        for rm in self.source_client.search_registered_models():
-            model_name = rm.name
+        # Try Unity Catalog format first, then fallback to standard
+        model_names_to_try = [
+            f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}.fraud-detection-model",
+            f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}.customer-churn-model",
+        ]
+
+        # First try standard search
+        found_models = []
+        try:
+            for rm in self.source_client.search_registered_models():
+                found_models.append(rm.name)
+        except Exception as e:
+            print(f"  Standard search failed: {e}")
+
+        # If standard search found nothing, use known Unity Catalog names
+        if not found_models:
+            print("  Using Unity Catalog model names...")
+            found_models = model_names_to_try
+
+        for model_name in found_models:
             short_name = model_name.replace(full_prefix, '')
-            versions = self.source_client.search_model_versions(f"name='{model_name}'")
+            try:
+                versions = self.source_client.search_model_versions(f"name='{model_name}'")
 
-            model_info = {
-                'full_name': model_name,
-                'short_name': short_name,
-                'versions': [],
-                'description': rm.description or '',
-                'tags': dict(rm.tags) if rm.tags else {},
-            }
-
-            for v in versions:
-                run = self.source_client.get_run(v.run_id) if v.run_id else None
-                version_info = {
-                    'version': v.version,
-                    'run_id': v.run_id,
-                    'status': v.status,
-                    'creation_timestamp': v.creation_timestamp,
-                    'params': dict(run.data.params) if run else {},
-                    'metrics': dict(run.data.metrics) if run else {},
-                    'tags': dict(run.data.tags) if run else {},
+                model_info = {
+                    'full_name': model_name,
+                    'short_name': short_name,
+                    'versions': [],
+                    'description': '',
+                    'tags': {},
                 }
-                model_info['versions'].append(version_info)
 
-            models.append(model_info)
-            print(f"\n  Model: {short_name}")
-            print(f"  Versions: {len(versions)}")
-            for vi in model_info['versions']:
-                acc = vi['metrics'].get('accuracy', 'N/A')
-                algo = vi['params'].get('algorithm', 'unknown')
-                print(f"    v{vi['version']}: {algo} (accuracy={acc})")
+                for v in versions:
+                    run = self.source_client.get_run(v.run_id) if v.run_id else None
+                    version_info = {
+                        'version': v.version,
+                        'run_id': v.run_id,
+                        'status': v.status,
+                        'creation_timestamp': v.creation_timestamp,
+                        'params': dict(run.data.params) if run else {},
+                        'metrics': dict(run.data.metrics) if run else {},
+                        'tags': dict(run.data.tags) if run else {},
+                    }
+                    model_info['versions'].append(version_info)
+
+                models.append(model_info)
+                print(f"\n  Model: {short_name}")
+                print(f"  Versions: {len(versions)}")
+                for vi in model_info['versions']:
+                    acc = vi['metrics'].get('accuracy', 'N/A')
+                    algo = vi['params'].get('algorithm', 'unknown')
+                    print(f"    v{vi['version']}: {algo} (accuracy={acc})")
+
+            except Exception as e:
+                print(f"\n  SKIP: {model_name} ({e})")
 
         print(f"\n  Total models found: {len(models)}")
         return models
