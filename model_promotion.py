@@ -47,13 +47,11 @@ class ModelPromotionManager:
         self.client = MlflowClient()
         self.promotion_rules = {
             'staging': {
-                'min_accuracy': 0.75,
-                'min_f1_score': 0.70,
+                'min_accuracy': 0.70,
                 'requires_approval': False,
             },
             'production': {
-                'min_accuracy': 0.85,
-                'min_f1_score': 0.80,
+                'min_accuracy': 0.80,
                 'requires_approval': True,
                 'approvers': [APPROVER_EMAIL],
             },

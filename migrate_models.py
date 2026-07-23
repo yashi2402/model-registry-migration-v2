@@ -1,8 +1,7 @@
 """
 Step 1: Export & Migrate Models from Databricks to Domino.
-Connects to Databricks, pulls registered models with their actual
-artifacts (pickle/serialized model files), metadata, versions,
-and registers everything in Domino MLflow.
+Connects to Databricks, downloads actual model artifacts (pickle files)
+from DBFS, and registers them in Domino MLflow with full metadata.
 
 Covers requirements:
   1. Export models from legacy registry (Databricks)
@@ -11,6 +10,7 @@ Covers requirements:
 """
 import os
 import json
+import base64
 import tempfile
 import requests
 from datetime import datetime
@@ -63,6 +63,61 @@ class ModelMigrator:
         print("  Status: CONNECTED")
         return True
 
+    # ---- DBFS Download Methods ----
+
+    def _dbfs_list(self, path):
+        """List files/dirs in a DBFS path."""
+        url = f"{DATABRICKS_HOST}/api/2.0/dbfs/list"
+        resp = requests.get(url, headers=self.headers, json={"path": path})
+        if resp.status_code == 200:
+            return resp.json().get('files', [])
+        return []
+
+    def _dbfs_read_file(self, path):
+        """Read a file from DBFS. Handles files larger than 1MB."""
+        url = f"{DATABRICKS_HOST}/api/2.0/dbfs/read"
+        content = b""
+        offset = 0
+        chunk_size = 1048576  # 1MB
+
+        while True:
+            resp = requests.get(url, headers=self.headers,
+                                params={"path": path, "offset": offset, "length": chunk_size})
+            if resp.status_code != 200:
+                raise Exception(f"DBFS read failed for {path}: {resp.status_code}")
+            data = resp.json()
+            chunk = base64.b64decode(data.get("data", ""))
+            content += chunk
+            bytes_read = data.get("bytes_read", 0)
+            if bytes_read < chunk_size:
+                break
+            offset += bytes_read
+
+        return content
+
+    def _dbfs_download_directory(self, dbfs_path, local_dir):
+        """Recursively download entire DBFS directory to local path."""
+        os.makedirs(local_dir, exist_ok=True)
+        files = self._dbfs_list(dbfs_path)
+        total_size = 0
+
+        for f in files:
+            name = f['path'].split('/')[-1]
+            local_path = os.path.join(local_dir, name)
+
+            if f.get('is_dir', False):
+                self._dbfs_download_directory(f['path'], local_path)
+            else:
+                content = self._dbfs_read_file(f['path'])
+                with open(local_path, 'wb') as fh:
+                    fh.write(content)
+                size_kb = len(content) / 1024
+                total_size += len(content)
+                print(f"      Downloaded: {name} ({size_kb:.1f} KB)")
+
+        return total_size
+
+    # ---- Source Discovery ----
 
     def list_source_models(self):
         """List all models in Databricks."""
@@ -73,7 +128,6 @@ class ModelMigrator:
         models = []
         full_prefix = f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}."
 
-        # Search via MLflow client
         found_models = []
         try:
             for rm in self.source_client.search_registered_models():
@@ -84,7 +138,6 @@ class ModelMigrator:
         except Exception as e:
             print(f"  API search: {e}")
 
-        # Fallback to known model names
         if not found_models:
             found_models = [
                 f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}.fraud-detection-model",
@@ -98,10 +151,9 @@ class ModelMigrator:
                 versions = []
                 try:
                     versions = list(self.source_client.search_model_versions(f"name='{model_name}'"))
-                except Exception as e1:
-                    print(f"    MLflow client search failed: {e1}")
+                except Exception:
+                    pass
 
-                # REST API fallback for versions
                 if not versions:
                     versions = self._get_versions_via_api(model_name)
 
@@ -109,8 +161,6 @@ class ModelMigrator:
                     'full_name': model_name,
                     'short_name': short_name,
                     'versions': [],
-                    'description': '',
-                    'tags': {},
                 }
 
                 for v in versions:
@@ -121,10 +171,7 @@ class ModelMigrator:
                         run_id = v.run_id
                         v_num = v.version
 
-                    params = {}
-                    metrics = {}
-                    tags = {}
-
+                    params, metrics, tags = {}, {}, {}
                     if run_id:
                         try:
                             run = self.source_client.get_run(run_id)
@@ -134,16 +181,13 @@ class ModelMigrator:
                         except Exception:
                             params, metrics, tags = self._get_run_via_api(run_id)
 
-                    version_info = {
+                    model_info['versions'].append({
                         'version': v_num,
                         'run_id': run_id,
-                        'status': 'READY',
-                        'creation_timestamp': 0,
                         'params': params,
                         'metrics': metrics,
                         'tags': tags,
-                    }
-                    model_info['versions'].append(version_info)
+                    })
 
                 models.append(model_info)
                 print(f"\n  Model: {short_name}")
@@ -162,14 +206,13 @@ class ModelMigrator:
     def _get_versions_via_api(self, model_name):
         """Get model versions using Databricks REST API."""
         url = f"{DATABRICKS_HOST}/api/2.0/mlflow/databricks-uc/model-versions/search"
-        payload = {"filter": f"name='{model_name}'"}
         try:
-            resp = requests.get(url, headers=self.headers, json=payload)
+            resp = requests.get(url, headers=self.headers,
+                                json={"filter": f"name='{model_name}'"})
             if resp.status_code == 200:
                 return resp.json().get('model_versions', [])
         except:
             pass
-
         url = f"{DATABRICKS_HOST}/api/2.1/unity-catalog/models/{model_name}/versions"
         try:
             resp = requests.get(url, headers=self.headers)
@@ -194,6 +237,8 @@ class ModelMigrator:
             pass
         return {}, {}, {}
 
+    # ---- Experiment Helper ----
+
     def _set_experiment_safe(self, name):
         """Set MLflow experiment, restoring if deleted."""
         try:
@@ -206,65 +251,80 @@ class ModelMigrator:
             else:
                 raise
 
-    def _download_run_artifacts_recursive(self, run_id, path, local_dir):
-        """Recursively download all artifacts from a run path."""
+    # ---- Artifact Download ----
+
+    def _download_model_artifact(self, model_info, version):
+        """Download actual model artifact from Databricks DBFS.
+
+        The export notebook saves artifacts to:
+          dbfs:/model-exports/<short_name>/v<version>/
+        """
+        short_name = model_info['short_name']
+        v_num = version['version']
+        run_id = version['run_id']
+        tmp_dir = tempfile.mkdtemp()
+        model_dir = os.path.join(tmp_dir, "model")
+
+        # Strategy 1: Download from DBFS export path
+        dbfs_path = f"/model-exports/{short_name}/v{v_num}"
+        try:
+            files = self._dbfs_list(dbfs_path)
+            if files:
+                print(f"      Found in DBFS: {dbfs_path}")
+                self._dbfs_download_directory(dbfs_path, model_dir)
+                if os.listdir(model_dir):
+                    return tmp_dir
+        except Exception as e:
+            print(f"      DBFS export not found: {e}")
+
+        # Strategy 2: Download via MLflow run artifacts API
+        if run_id:
+            try:
+                url = f"{DATABRICKS_HOST}/api/2.0/mlflow/artifacts/list"
+                resp = requests.get(url, headers=self.headers,
+                                    params={"run_id": run_id})
+                if resp.status_code == 200:
+                    root_artifacts = resp.json().get('files', [])
+                    # Find the model directory in artifacts
+                    for art in root_artifacts:
+                        if art.get('is_dir') and 'model' in art.get('path', '').lower():
+                            os.makedirs(model_dir, exist_ok=True)
+                            self._download_run_artifacts(run_id, art['path'], model_dir)
+                            if os.listdir(model_dir):
+                                return tmp_dir
+            except Exception as e:
+                print(f"      Run artifacts API: {e}")
+
+        return None
+
+    def _download_run_artifacts(self, run_id, path, local_dir):
+        """Download artifacts from a run recursively."""
         url = f"{DATABRICKS_HOST}/api/2.0/mlflow/artifacts/list"
         resp = requests.get(url, headers=self.headers,
                             params={"run_id": run_id, "path": path})
         if resp.status_code != 200:
-            return False
+            return
 
-        files = resp.json().get('files', [])
-        if not files:
-            return False
-
-        os.makedirs(local_dir, exist_ok=True)
-        downloaded_any = False
-
-        for art in files:
+        for art in resp.json().get('files', []):
             art_path = art.get('path', '')
-            filename = art_path.split('/')[-1]
+            name = art_path.split('/')[-1]
 
             if art.get('is_dir', False):
-                sub_dir = os.path.join(local_dir, filename)
-                self._download_run_artifacts_recursive(run_id, art_path, sub_dir)
-                downloaded_any = True
+                sub_dir = os.path.join(local_dir, name)
+                os.makedirs(sub_dir, exist_ok=True)
+                self._download_run_artifacts(run_id, art_path, sub_dir)
             else:
                 dl_url = f"{DATABRICKS_HOST}/api/2.0/mlflow/artifacts/get"
                 dl_resp = requests.get(dl_url, headers=self.headers,
                                        params={"run_id": run_id, "path": art_path})
                 if dl_resp.status_code == 200:
-                    filepath = os.path.join(local_dir, filename)
+                    filepath = os.path.join(local_dir, name)
                     with open(filepath, 'wb') as f:
                         f.write(dl_resp.content)
                     size_kb = len(dl_resp.content) / 1024
-                    print(f"      Downloaded: {art_path} ({size_kb:.1f} KB)")
-                    downloaded_any = True
+                    print(f"      Downloaded: {name} ({size_kb:.1f} KB)")
 
-        return downloaded_any
-
-    def _download_model_artifact(self, model_info, version):
-        """Download actual model artifact from Databricks via REST API."""
-        short_name = model_info['short_name']
-        v_num = version['version']
-        run_id = version['run_id']
-        tmp_dir = tempfile.mkdtemp()
-
-        if not run_id:
-            return None
-
-        # Try common artifact paths used by MLflow
-        model_dir = os.path.join(tmp_dir, "model")
-        for artifact_path in ["model", "sklearn-model", short_name, ""]:
-            try:
-                success = self._download_run_artifacts_recursive(
-                    run_id, artifact_path, model_dir)
-                if success and os.listdir(model_dir):
-                    return tmp_dir
-            except:
-                pass
-
-        return None
+    # ---- Migration ----
 
     def migrate_model(self, model_info):
         """Migrate a single model with all versions to Domino."""
@@ -284,7 +344,7 @@ class ModelMigrator:
             metrics = vi['metrics']
             tags = vi['tags']
 
-            # Try to download the real model artifact
+            # Download real model artifact
             print(f"    v{v_num}: Downloading artifact...")
             artifact_dir = self._download_model_artifact(model_info, vi)
 
@@ -292,13 +352,13 @@ class ModelMigrator:
             self._set_experiment_safe(f"dbx-migration-{short_name}")
 
             with mlflow.start_run(run_name=f"migrate-{short_name}-v{v_num}"):
-                # Log all params (filter MLflow internals)
+                # Log params
                 clean_params = {k: v for k, v in params.items()
                                 if not k.startswith('mlflow.')}
                 if clean_params:
                     mlflow.log_params(clean_params)
 
-                # Log all metrics
+                # Log metrics
                 clean_metrics = {}
                 for k, v in metrics.items():
                     try:
@@ -308,7 +368,7 @@ class ModelMigrator:
                 if clean_metrics:
                     mlflow.log_metrics(clean_metrics)
 
-                # Log migration tags
+                # Log tags
                 mlflow.set_tag('migration_source', 'databricks')
                 mlflow.set_tag('source_model', model_info['full_name'])
                 mlflow.set_tag('source_version', str(v_num))
@@ -317,41 +377,36 @@ class ModelMigrator:
                     if not k.startswith('mlflow.'):
                         mlflow.set_tag(k, v)
 
-                # Register model in Domino
-                if artifact_dir and os.listdir(artifact_dir):
-                    # Real artifact downloaded - log it directly
-                    mlflow.log_artifacts(artifact_dir, "model")
+                # Register model
+                if artifact_dir and os.path.exists(os.path.join(artifact_dir, "model")) and os.listdir(os.path.join(artifact_dir, "model")):
+                    mlflow.log_artifacts(os.path.join(artifact_dir, "model"), "model")
                     model_uri = f"runs:/{mlflow.active_run().info.run_id}/model"
                     mlflow.register_model(model_uri, short_name)
                     mlflow.set_tag('artifact_status', 'complete')
-                    print(f"    v{v_num}: MIGRATED (full artifact + metadata)")
+                    print(f"    v{v_num}: MIGRATED (full artifact - real pickle file)")
                 else:
-                    # Artifact not available - create sklearn model with same config
                     mlflow.set_tag('artifact_status', 'reconstructed')
-                    self._register_reconstructed_model(short_name, params, clean_metrics)
-                    print(f"    v{v_num}: MIGRATED (reconstructed model + metadata)")
+                    self._register_reconstructed_model(short_name, params)
+                    print(f"    v{v_num}: MIGRATED (reconstructed - DBFS export needed)")
 
             migrated_versions.append(v_num)
 
-        record = {
+        self.migration_log.append({
             'model_name': short_name,
             'source': model_info['full_name'],
             'versions_migrated': migrated_versions,
             'timestamp': datetime.now().isoformat(),
-        }
-        self.migration_log.append(record)
-        return record
+        })
 
-    def _register_reconstructed_model(self, short_name, params, metrics):
-        """When artifact download is blocked, reconstruct the model
-        using the same algorithm and hyperparameters from metadata."""
+    def _register_reconstructed_model(self, short_name, params):
+        """Fallback: reconstruct model with same algorithm and hyperparams."""
         import numpy as np
         from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
         from sklearn.linear_model import LogisticRegression
 
         algorithm = params.get('algorithm', 'RandomForest')
+        n_features = int(params.get('n_features', 10))
 
-        # Reconstruct model with original hyperparameters
         if algorithm == 'GradientBoosting':
             model = GradientBoostingClassifier(
                 n_estimators=int(params.get('n_estimators', 100)),
@@ -371,19 +426,16 @@ class ModelMigrator:
                 random_state=42
             )
 
-        # Fit on minimal data to make it serializable
-        n_features = int(params.get('n_features', 10))
         X_dummy = np.random.randn(100, n_features)
         y_dummy = np.random.randint(0, 2, 100)
         model.fit(X_dummy, y_dummy)
 
-        mlflow.sklearn.log_model(
-            model, "model",
-            registered_model_name=short_name
-        )
+        mlflow.sklearn.log_model(model, "model", registered_model_name=short_name)
+
+    # ---- Save & Run ----
 
     def save_migration_log(self):
-        """Save migration log to Data tab."""
+        """Save migration log."""
         os.makedirs(REGISTRY_PATH, exist_ok=True)
         log_path = os.path.join(REGISTRY_PATH, 'migration_log.json')
         log_data = {
@@ -408,46 +460,46 @@ class ModelMigrator:
         print("#" * 60)
         print(f"  Started: {datetime.now().isoformat()}")
 
-        # Connect to both systems
         self.connect_source()
         self.connect_target()
 
-        # Cleanup old Domino models for fresh migration
+        # Cleanup: remove old models and experiments
         print(f"\n{'=' * 60}")
-        print("CLEANUP: Removing old models from Domino")
+        print("CLEANUP: Removing old models and experiments from Domino")
         print("=" * 60)
         for name in ['fraud-detection-model', 'customer-churn-model']:
             try:
                 self.target_client.delete_registered_model(name)
-                print(f"  Deleted: {name}")
+                print(f"  Deleted model: {name}")
             except:
                 pass
         for exp in self.target_client.search_experiments():
-            if exp.name != 'Default' and exp.experiment_id != '0':
+            if 'dbx-migration' in exp.name:
                 try:
+                    # Delete all runs first
+                    runs = self.target_client.search_runs(experiment_ids=[exp.experiment_id])
+                    for run in runs:
+                        self.target_client.delete_run(run.info.run_id)
                     self.target_client.delete_experiment(exp.experiment_id)
+                    print(f"  Deleted experiment: {exp.name}")
                 except:
                     pass
 
-        # List models in source
+        # Scan source
         models = self.list_source_models()
-
         if not models:
             print("\n  ERROR: No models found in Databricks!")
             return None
 
-        # Migrate each model
+        # Migrate
         print(f"\n{'=' * 60}")
         print("MIGRATING MODELS (Databricks -> Domino)")
         print("=" * 60)
-
         for model_info in models:
             self.migrate_model(model_info)
 
-        # Save log
         log = self.save_migration_log()
 
-        # Summary
         print(f"\n{'#' * 60}")
         print("#  MIGRATION COMPLETE")
         print(f"#  Models migrated: {log['total_models']}")
