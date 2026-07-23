@@ -157,6 +157,13 @@ class ModelMigrator:
                 if not versions:
                     versions = self._get_versions_via_api(model_name)
 
+                # Sort versions ascending so v1 registers first in Domino
+                if versions:
+                    if isinstance(versions[0], dict):
+                        versions.sort(key=lambda v: int(v.get('version', 0)))
+                    else:
+                        versions.sort(key=lambda v: int(v.version))
+
                 model_info = {
                     'full_name': model_name,
                     'short_name': short_name,
