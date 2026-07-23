@@ -342,7 +342,7 @@ class ModelMigrator:
         print(f"  Target: Domino MLflow")
 
         mlflow.set_tracking_uri(DOMINO_MLFLOW_URI)
-        self._set_experiment_safe(f"dbx-migration-{short_name}-{self._experiment_suffix}")
+        self._set_experiment_safe(f"dbx-migration-{short_name}")
 
         migrated_versions = []
 
@@ -357,7 +357,7 @@ class ModelMigrator:
             artifact_dir = self._download_model_artifact(model_info, vi)
 
             mlflow.set_tracking_uri(DOMINO_MLFLOW_URI)
-            self._set_experiment_safe(f"dbx-migration-{short_name}-{self._experiment_suffix}")
+            self._set_experiment_safe(f"dbx-migration-{short_name}")
 
             with mlflow.start_run(run_name=f"migrate-{short_name}-v{v_num}"):
                 # Log params
@@ -471,9 +471,9 @@ class ModelMigrator:
         self.connect_source()
         self.connect_target()
 
-        # Cleanup: remove old models
+        # Cleanup: remove old models and soft-delete old runs
         print(f"\n{'=' * 60}")
-        print("CLEANUP: Removing old models from Domino")
+        print("CLEANUP: Removing old models and runs from Domino")
         print("=" * 60)
         for rm in self.target_client.search_registered_models():
             try:
@@ -481,9 +481,14 @@ class ModelMigrator:
                 print(f"  Deleted model: {rm.name}")
             except:
                 pass
-
-        # Use unique experiment names with timestamp to avoid reusing soft-deleted experiments
-        self._experiment_suffix = datetime.now().strftime('%Y%m%d-%H%M%S')
+        # Soft-delete runs in existing experiments (don't delete the experiment itself)
+        for exp in self.target_client.search_experiments():
+            if 'dbx-migration' in exp.name:
+                runs = self.target_client.search_runs(experiment_ids=[exp.experiment_id])
+                for run in runs:
+                    self.target_client.delete_run(run.info.run_id)
+                if runs:
+                    print(f"  Cleaned runs: {exp.name} ({len(runs)} runs soft-deleted)")
 
         # Scan source
         models = self.list_source_models()
