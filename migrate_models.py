@@ -11,9 +11,11 @@ Covers requirements:
 import os
 import json
 import tempfile
+import requests
 from datetime import datetime
 
 import mlflow
+import mlflow.sklearn
 from mlflow.tracking import MlflowClient
 
 from config import (
@@ -42,7 +44,7 @@ class ModelMigrator:
 
         self.source_client = MlflowClient(
             tracking_uri='databricks',
-            registry_uri='databricks'
+            registry_uri='databricks-uc'
         )
         print("  Status: CONNECTED")
         return True
@@ -59,6 +61,74 @@ class ModelMigrator:
         print("  Status: CONNECTED")
         return True
 
+    def _get_versions_via_api(self, model_name):
+        """Get model versions using Databricks REST API directly."""
+        headers = {'Authorization': f'Bearer {DATABRICKS_TOKEN}'}
+        url = f"{DATABRICKS_HOST}/api/2.0/mlflow/databricks-uc/model-versions/search"
+        payload = {"filter": f"name='{model_name}'"}
+        try:
+            resp = requests.get(url, headers=headers, json=payload)
+            if resp.status_code == 200:
+                return resp.json().get('model_versions', [])
+        except:
+            pass
+
+        # Try Unity Catalog API
+        url = f"{DATABRICKS_HOST}/api/2.1/unity-catalog/models/{model_name}/versions"
+        try:
+            resp = requests.get(url, headers=headers)
+            if resp.status_code == 200:
+                return resp.json().get('model_versions', [])
+        except:
+            pass
+
+        return []
+
+    def _get_experiment_runs(self, model_name):
+        """Get experiment runs for a model from Databricks."""
+        headers = {'Authorization': f'Bearer {DATABRICKS_TOKEN}'}
+        short_name = model_name.replace(f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}.", '')
+
+        # Search for experiment
+        url = f"{DATABRICKS_HOST}/api/2.0/mlflow/experiments/search"
+        try:
+            resp = requests.get(url, headers=headers, json={"filter": f"name = '/model-registry-migration'"})
+            if resp.status_code == 200:
+                experiments = resp.json().get('experiments', [])
+                if experiments:
+                    exp_id = experiments[0]['experiment_id']
+                    # Get runs
+                    url = f"{DATABRICKS_HOST}/api/2.0/mlflow/runs/search"
+                    resp = requests.post(url, headers=headers, json={
+                        "experiment_ids": [exp_id],
+                        "filter": f"tags.mlflow.runName LIKE '%{short_name}%'"
+                    })
+                    if resp.status_code == 200:
+                        return resp.json().get('runs', [])
+        except:
+            pass
+
+        # Fallback: get all runs from the experiment
+        url = f"{DATABRICKS_HOST}/api/2.0/mlflow/experiments/search"
+        try:
+            resp = requests.get(url, headers=headers)
+            if resp.status_code == 200:
+                for exp in resp.json().get('experiments', []):
+                    if 'model-registry-migration' in exp.get('name', ''):
+                        url = f"{DATABRICKS_HOST}/api/2.0/mlflow/runs/search"
+                        resp = requests.post(url, headers=headers, json={
+                            "experiment_ids": [exp['experiment_id']]
+                        })
+                        if resp.status_code == 200:
+                            runs = resp.json().get('runs', [])
+                            # Filter runs matching this model
+                            matching = [r for r in runs if short_name in r.get('info', {}).get('run_name', '')]
+                            if matching:
+                                return matching
+        except:
+            pass
+        return []
+
     def list_source_models(self):
         """List all models in Databricks."""
         print(f"\n{'=' * 60}")
@@ -68,29 +138,59 @@ class ModelMigrator:
         models = []
         full_prefix = f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}."
 
-        # Try Unity Catalog format first, then fallback to standard
+        # Unity Catalog model names
         model_names_to_try = [
             f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}.fraud-detection-model",
             f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}.customer-churn-model",
         ]
 
-        # First try standard search
+        # Try searching via API first
         found_models = []
         try:
             for rm in self.source_client.search_registered_models():
                 found_models.append(rm.name)
+            if found_models:
+                print(f"  Found {len(found_models)} models via API search")
         except Exception as e:
-            print(f"  Standard search failed: {e}")
+            print(f"  API search: {e}")
 
-        # If standard search found nothing, use known Unity Catalog names
+        # Use known Unity Catalog names if API search didn't work
         if not found_models:
-            print("  Using Unity Catalog model names...")
             found_models = model_names_to_try
+            print(f"  Using known model names: {len(found_models)} models")
 
         for model_name in found_models:
             short_name = model_name.replace(full_prefix, '')
             try:
-                versions = self.source_client.search_model_versions(f"name='{model_name}'")
+                # Try MLflow client first
+                versions = []
+                try:
+                    versions = list(self.source_client.search_model_versions(f"name='{model_name}'"))
+                except Exception as e1:
+                    print(f"    MLflow client search failed: {e1}")
+
+                # If no versions found, try REST API
+                if not versions:
+                    api_versions = self._get_versions_via_api(model_name)
+                    if api_versions:
+                        versions = api_versions
+                        print(f"    Found {len(versions)} versions via REST API")
+
+                # If still no versions, get info from experiment runs
+                if not versions:
+                    runs = self._get_experiment_runs(model_name)
+                    if runs:
+                        print(f"    Found {len(runs)} runs via experiment search")
+                        # Create version-like entries from runs
+                        versions = []
+                        for i, run in enumerate(runs):
+                            versions.append({
+                                'version': str(i + 1),
+                                'run_id': run.get('info', {}).get('run_id', ''),
+                                'status': 'READY',
+                                'creation_timestamp': run.get('info', {}).get('start_time', 0),
+                                '_is_run': True,
+                            })
 
                 model_info = {
                     'full_name': model_name,
@@ -101,21 +201,52 @@ class ModelMigrator:
                 }
 
                 for v in versions:
-                    run = self.source_client.get_run(v.run_id) if v.run_id else None
+                    # Handle both MLflow version objects and dict from REST API
+                    if isinstance(v, dict):
+                        run_id = v.get('run_id', '')
+                        v_num = v.get('version', '1')
+                    else:
+                        run_id = v.run_id
+                        v_num = v.version
+
+                    params = {}
+                    metrics = {}
+                    tags = {}
+
+                    if run_id:
+                        try:
+                            run = self.source_client.get_run(run_id)
+                            params = dict(run.data.params)
+                            metrics = dict(run.data.metrics)
+                            tags = dict(run.data.tags)
+                        except Exception:
+                            # Try REST API for run data
+                            headers = {'Authorization': f'Bearer {DATABRICKS_TOKEN}'}
+                            url = f"{DATABRICKS_HOST}/api/2.0/mlflow/runs/get"
+                            try:
+                                resp = requests.get(url, headers=headers, params={'run_id': run_id})
+                                if resp.status_code == 200:
+                                    run_data = resp.json().get('run', {}).get('data', {})
+                                    params = {p['key']: p['value'] for p in run_data.get('params', [])}
+                                    metrics = {m['key']: m['value'] for m in run_data.get('metrics', [])}
+                                    tags = {t['key']: t['value'] for t in run_data.get('tags', [])}
+                            except:
+                                pass
+
                     version_info = {
-                        'version': v.version,
-                        'run_id': v.run_id,
-                        'status': v.status,
-                        'creation_timestamp': v.creation_timestamp,
-                        'params': dict(run.data.params) if run else {},
-                        'metrics': dict(run.data.metrics) if run else {},
-                        'tags': dict(run.data.tags) if run else {},
+                        'version': v_num,
+                        'run_id': run_id,
+                        'status': 'READY',
+                        'creation_timestamp': 0,
+                        'params': params,
+                        'metrics': metrics,
+                        'tags': tags,
                     }
                     model_info['versions'].append(version_info)
 
                 models.append(model_info)
                 print(f"\n  Model: {short_name}")
-                print(f"  Versions: {len(versions)}")
+                print(f"  Versions: {len(model_info['versions'])}")
                 for vi in model_info['versions']:
                     acc = vi['metrics'].get('accuracy', 'N/A')
                     algo = vi['params'].get('algorithm', 'unknown')
