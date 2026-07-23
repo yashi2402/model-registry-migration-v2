@@ -342,7 +342,7 @@ class ModelMigrator:
         print(f"  Target: Domino MLflow")
 
         mlflow.set_tracking_uri(DOMINO_MLFLOW_URI)
-        self._set_experiment_safe(f"dbx-migration-{short_name}")
+        self._set_experiment_safe(f"dbx-migration-{short_name}-{self._experiment_suffix}")
 
         migrated_versions = []
 
@@ -357,7 +357,7 @@ class ModelMigrator:
             artifact_dir = self._download_model_artifact(model_info, vi)
 
             mlflow.set_tracking_uri(DOMINO_MLFLOW_URI)
-            self._set_experiment_safe(f"dbx-migration-{short_name}")
+            self._set_experiment_safe(f"dbx-migration-{short_name}-{self._experiment_suffix}")
 
             with mlflow.start_run(run_name=f"migrate-{short_name}-v{v_num}"):
                 # Log params
@@ -471,36 +471,19 @@ class ModelMigrator:
         self.connect_source()
         self.connect_target()
 
-        # Cleanup: remove old models and experiments
+        # Cleanup: remove old models
         print(f"\n{'=' * 60}")
-        print("CLEANUP: Removing old models and experiments from Domino")
+        print("CLEANUP: Removing old models from Domino")
         print("=" * 60)
-        for name in ['fraud-detection-model', 'customer-churn-model']:
+        for rm in self.target_client.search_registered_models():
             try:
-                self.target_client.delete_registered_model(name)
-                print(f"  Deleted model: {name}")
+                self.target_client.delete_registered_model(rm.name)
+                print(f"  Deleted model: {rm.name}")
             except:
                 pass
-        # Clean ALL runs from migration experiments (including soft-deleted)
-        all_experiments = self.target_client.search_experiments(view_type=mlflow.entities.ViewType.ALL)
-        for exp in all_experiments:
-            if 'dbx-migration' in exp.name:
-                try:
-                    # Restore if deleted so we can access runs
-                    if exp.lifecycle_stage == 'deleted':
-                        self.target_client.restore_experiment(exp.experiment_id)
-                    # Delete all runs permanently
-                    runs = self.target_client.search_runs(
-                        experiment_ids=[exp.experiment_id],
-                        filter_string="",
-                        run_view_type=mlflow.entities.ViewType.ALL
-                    )
-                    for run in runs:
-                        self.target_client.delete_run(run.info.run_id)
-                    self.target_client.delete_experiment(exp.experiment_id)
-                    print(f"  Cleaned: {exp.name} ({len(runs)} runs removed)")
-                except:
-                    pass
+
+        # Use unique experiment names with timestamp to avoid reusing soft-deleted experiments
+        self._experiment_suffix = datetime.now().strftime('%Y%m%d-%H%M%S')
 
         # Scan source
         models = self.list_source_models()
