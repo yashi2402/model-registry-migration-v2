@@ -34,7 +34,7 @@ def show_migrated_lineage():
 
     # Show experiments (migration runs)
     experiments = client.search_experiments()
-    migration_exps = [e for e in experiments if 'migration' in e.name.lower()]
+    migration_exps = [e for e in experiments if 'dbx-migration' in e.name.lower()]
 
     print(f"\n  Migration experiments found: {len(migration_exps)}")
 

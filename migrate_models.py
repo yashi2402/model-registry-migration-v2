@@ -279,7 +279,7 @@ class ModelMigrator:
         print(f"  Source: Databricks ({model_info['full_name']})")
         print(f"  Target: Domino MLflow")
 
-        self._set_experiment_safe(f"migration-{short_name}")
+        self._set_experiment_safe(f"dbx-migration-{short_name}")
 
         migrated_versions = []
 
@@ -301,7 +301,7 @@ class ModelMigrator:
 
                 # Register in Domino MLflow
                 mlflow.set_tracking_uri(DOMINO_MLFLOW_URI)
-                self._set_experiment_safe(f"migration-{short_name}")
+                self._set_experiment_safe(f"dbx-migration-{short_name}")
 
                 with mlflow.start_run(run_name=f"migrate-{short_name}-v{v_num}"):
                     # Log params (filter MLflow internal tags)
@@ -357,7 +357,7 @@ class ModelMigrator:
         tags = vi['tags']
 
         mlflow.set_tracking_uri(DOMINO_MLFLOW_URI)
-        self._set_experiment_safe(f"migration-{short_name}")
+        self._set_experiment_safe(f"dbx-migration-{short_name}")
 
         with mlflow.start_run(run_name=f"migrate-{short_name}-v{v_num}"):
             clean_params = {k: v for k, v in params.items()
