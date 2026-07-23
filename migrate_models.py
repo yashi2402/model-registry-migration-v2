@@ -148,9 +148,11 @@ class ModelMigrator:
         found_models = []
         try:
             for rm in self.source_client.search_registered_models():
-                found_models.append(rm.name)
+                # Only include models from OUR catalog, skip system.ai models
+                if rm.name.startswith(f"{DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}."):
+                    found_models.append(rm.name)
             if found_models:
-                print(f"  Found {len(found_models)} models via API search")
+                print(f"  Found {len(found_models)} models in {DATABRICKS_CATALOG}.{DATABRICKS_SCHEMA}")
         except Exception as e:
             print(f"  API search: {e}")
 
